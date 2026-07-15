@@ -87,7 +87,7 @@ for name in "${NAMES_BY_LEN[@]}"; do
     rest="${B#"${name}-"}"
     if [[ $rest =~ ^release-([0-9].*)\.tgz$ ]]; then
       src_match="$f"
-    elif [[ $rest =~ ^([0-9][^[:space:]]*)-(ubuntu-[a-z0-9]+|windows-[0-9]+)-([0-9]+(\.[0-9]+)*)-[0-9]{4}-[0-9]{2}-[0-9]{2}-.*\.tgz$ ]]; then
+    elif [[ $rest =~ ^([0-9][^[:space:]]*)-(ubuntu-[a-z0-9]+|windows-[0-9]+)-([0-9]+(\.[0-9]+)*)(-.*)?\.tgz$ ]]; then
       comp_matches+=("$f")
     fi
   done
@@ -98,7 +98,7 @@ for name in "${NAMES_BY_LEN[@]}"; do
     file="$(printf '%s\n' "${comp_matches[@]}" | sort | tail -n1)"
     [[ ${#comp_matches[@]} -gt 1 ]] && info "NOTE: $name: ${#comp_matches[@]} compiled tarballs, using $(basename "$file")"
     B="$(basename "$file")"; rest="${B#"${name}-"}"
-    [[ $rest =~ ^([0-9][^[:space:]]*)-(ubuntu-[a-z0-9]+|windows-[0-9]+)-([0-9]+(\.[0-9]+)*)- ]] || die "internal: reparse failed for $B"
+    [[ $rest =~ ^([0-9][^[:space:]]*)-(ubuntu-[a-z0-9]+|windows-[0-9]+)-([0-9]+(\.[0-9]+)*)(-.*)?\.tgz$ ]] || die "internal: reparse failed for $B"
     compiled=1
     ver="${BASH_REMATCH[1]}"
     stemos_full="${BASH_REMATCH[2]}"
