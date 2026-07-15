@@ -28,7 +28,7 @@ shopt -s nullglob
 
 DRY_RUN=0
 OS_STYLE="short"                       # short: "noble"  | full: "ubuntu-noble"
-PREFIX="/opt/ocfp/bosh/releases"
+PREFIX="file:///opt/ocfp/bosh/releases"
 
 die()  { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "$*" >&2; }
