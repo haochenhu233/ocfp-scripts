@@ -1,0 +1,9 @@
+---
+applications:
+- name: win-hwc
+  stack: windows
+  buildpacks:
+  - hwc_buildpack
+  instances: 1
+  memory: 512M
+  disk_quota: 512M

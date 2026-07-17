@@ -1,0 +1,10 @@
+---
+applications:
+- name: win-bin
+  stack: windows
+  buildpacks:
+  - binary_buildpack
+  instances: 1
+  memory: 128M
+  disk_quota: 256M
+  command: app.exe
