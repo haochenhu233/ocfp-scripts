@@ -42,10 +42,25 @@ echo; echo "== T2  source IP the app sees =="
 echo "-- win-hwc --"; curl -ksS "$HWC/whoami.ashx"; echo
 echo "-- win-bin --"; curl -ksS "$BIN/whoami"; echo
 
-echo; echo "== T3  c2c (each app calls the other over apps.internal) =="
-echo "-- hwc -> bin --"; curl -ksS "$HWC/callout.ashx?target=win-bin.apps.internal:8080&path=/whoami"; echo
-echo "-- bin -> hwc --"; curl -ksS "$BIN/callout?target=win-hwc.apps.internal:8080&path=/whoami.ashx"; echo
+echo; echo "== T3  c2c (by overlay IP; still enforced by the network policy) =="
+BININT=$(curl -ksS "$BIN/whoami"      | sed 's/.*"cf_instance_internal_ip":"\([^"]*\)".*/\1/')
+HWCINT=$(curl -ksS "$HWC/whoami.ashx" | sed 's/.*"cf_instance_internal_ip":"\([^"]*\)".*/\1/')
+echo "win-bin ip: $BININT   win-hwc ip: $HWCINT"
+echo "-- hwc -> bin --"; curl -ksS "$HWC/callout.ashx?target=$BININT:8080&path=/whoami"; echo
+echo "-- bin -> hwc --"; curl -ksS "$BIN/callout?target=$HWCINT:8080&path=/whoami.ashx"; echo
 } | tee "$OUT"
+```
+
+> c2c by **overlay IP** deliberately bypasses `apps.internal` DNS. Our concern is
+> whether the route-integrity proxy affects the c2c network path, not name resolution.
+> If `apps.internal` does not resolve inside Windows containers, that is a separate
+> service-discovery / Windows-container-DNS matter (check `cf domains` for the internal
+> domain, `cf app win-bin` for the mapped internal route, and the winc_network DNS
+> config) — independent of this upgrade. IP-based c2c is sufficient here.
+
+```bash
+# (T1 warm-latency note) run T1 two or three times and record the WARM number;
+# win-hwc's first hit is ASP.NET/IIS cold start, not representative.
 ```
 
 Baseline (52.0.0) should show:
