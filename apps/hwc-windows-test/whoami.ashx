@@ -20,6 +20,9 @@ public class WhoAmI : IHttpHandler {
     f("cf_instance_index",       Environment.GetEnvironmentVariable("CF_INSTANCE_INDEX"));
     f("cf_instance_ip",          Environment.GetEnvironmentVariable("CF_INSTANCE_IP"));
     f("cf_instance_internal_ip", Environment.GetEnvironmentVariable("CF_INSTANCE_INTERNAL_IP"));
+    f("cf_instance_addr",        Environment.GetEnvironmentVariable("CF_INSTANCE_ADDR"));
+    f("cf_instance_port",        Environment.GetEnvironmentVariable("CF_INSTANCE_PORT"));
+    f("cf_instance_ports",       Environment.GetEnvironmentVariable("CF_INSTANCE_PORTS"));
     s.AppendFormat("\"port\":\"{0}\"}}", Environment.GetEnvironmentVariable("PORT"));
     c.Response.ContentType = "application/json";
     c.Response.Write(s.ToString());

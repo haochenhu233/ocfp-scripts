@@ -72,18 +72,26 @@ Baseline (52.0.0) should show:
 Check the `"port"` field in T2. If it is not `8080`, change the `:8080` in the T3
 `target` values and in the network policies to match.
 
-## 4. Direct cell:port  (optional; needs cell-network / BBS access)
+## 4. Direct cell:port  (optional; needs reachability to the cell network)
 Confirms that direct `cell-IP:host-port` access (bypassing the routers) is blocked
-after the upgrade. Skip if reaching a jumpbox on the diego subnet is impractical.
+after the upgrade. **No cfdot/BBS access needed** — the app reports its own cell IP
+and host port via `CF_INSTANCE_ADDR` / `CF_INSTANCE_PORTS`.
 ```bash
-APPGUID=$(cf app win-hwc --guid)
-# on a VM with cfdot/BBS access, e.g.  bosh ssh scheduler/0
-cfdot actual-lrps | jq -c --arg g "$APPGUID" \
-  'select(.process_guid|startswith($g)) | .actual_lrp_net_info | {address, ports}'
-# then from a jumpbox that can reach that cell IP:
-curl -ksS -o /dev/null -w "direct code=%{http_code}\n" http://<cell-ip>:<host_port>/health.ashx
+# read the cell-ip:host-port straight from the app
+ADDR=$(curl -ksS "$HWC/whoami.ashx" | sed 's/.*"cf_instance_addr":"\([^"]*\)".*/\1/')
+echo "cell addr: $ADDR"
+curl -ksS "$HWC/whoami.ashx" | sed 's/.*"cf_instance_ports":"\([^"]*\)".*/all ports: \1/'
+
+# from any host that can route to the cell network (your bastion, if it can reach cells):
+curl -ksS -o /dev/null -w "direct code=%{http_code}  time=%{time_total}s\n" "http://$ADDR/health.ashx"
 ```
-Baseline: reachable, `code=200`.
+Baseline (52.0.0): reachable, `code=200`. After upgrade: connection reset / TLS
+handshake error (the port now demands a router client cert).
+
+Skip this test entirely if your bastion cannot route to the diego cell subnet — it
+only confirms the anti-pattern behavior we are already confident about. If you
+prefer cfdot, it lives on the Diego VMs (not the bastion): `bosh ssh scheduler/0`
+(or `diego-api/0`) and run it there.
 
 ## 5. Capacity baseline
 ```bash

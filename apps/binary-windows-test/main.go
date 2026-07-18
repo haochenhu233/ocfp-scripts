@@ -32,6 +32,9 @@ func whoami(w http.ResponseWriter, r *http.Request) {
 		"cf_instance_index":       env("CF_INSTANCE_INDEX"),
 		"cf_instance_ip":          env("CF_INSTANCE_IP"),
 		"cf_instance_internal_ip": env("CF_INSTANCE_INTERNAL_IP"),
+		"cf_instance_addr":        env("CF_INSTANCE_ADDR"),
+		"cf_instance_port":        env("CF_INSTANCE_PORT"),
+		"cf_instance_ports":       env("CF_INSTANCE_PORTS"),
 		"port":                    env("PORT"),
 	})
 }
