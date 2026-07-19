@@ -42,21 +42,30 @@ echo; echo "== T2  source IP the app sees =="
 echo "-- win-hwc --"; curl -ksS "$HWC/whoami.ashx"; echo
 echo "-- win-bin --"; curl -ksS "$BIN/whoami"; echo
 
-echo; echo "== T3  c2c (by overlay IP; still enforced by the network policy) =="
-BININT=$(curl -ksS "$BIN/whoami"      | sed 's/.*"cf_instance_internal_ip":"\([^"]*\)".*/\1/')
-HWCINT=$(curl -ksS "$HWC/whoami.ashx" | sed 's/.*"cf_instance_internal_ip":"\([^"]*\)".*/\1/')
+echo; echo "== T3  c2c (by container IP from local_addr; still enforced by the network policy) =="
+# Use local_addr (the container's own IP) as the c2c target. On Windows,
+# CF_INSTANCE_INTERNAL_IP is often empty, which would make the target :8080 -> localhost.
+BININT=$(curl -ksS "$BIN/whoami"      | sed 's/.*"local_addr":"\([^"]*\)".*/\1/')
+HWCINT=$(curl -ksS "$HWC/whoami.ashx" | sed 's/.*"local_addr":"\([^"]*\)".*/\1/')
 echo "win-bin ip: $BININT   win-hwc ip: $HWCINT"
 echo "-- hwc -> bin --"; curl -ksS "$HWC/callout.ashx?target=$BININT:8080&path=/whoami"; echo
 echo "-- bin -> hwc --"; curl -ksS "$BIN/callout?target=$HWCINT:8080&path=/whoami.ashx"; echo
 } | tee "$OUT"
 ```
 
-> c2c by **overlay IP** deliberately bypasses `apps.internal` DNS. Our concern is
+> c2c by **container IP** deliberately bypasses `apps.internal` DNS. Our concern is
 > whether the route-integrity proxy affects the c2c network path, not name resolution.
-> If `apps.internal` does not resolve inside Windows containers, that is a separate
-> service-discovery / Windows-container-DNS matter (check `cf domains` for the internal
-> domain, `cf app win-bin` for the mapped internal route, and the winc_network DNS
-> config) — independent of this upgrade. IP-based c2c is sufficient here.
+> `local_addr` is the app's own container IP (e.g. a Windows HNS `172.30.0.x`), which
+> is populated in both the pre- and post-upgrade states; `CF_INSTANCE_INTERNAL_IP` is
+> often empty on Windows, so we do NOT use it here.
+>
+> A passing T3 returns the OTHER app's whoami, and inside it the destination's
+> `remote_addr` is the CALLER's container IP (not `127.0.0.1`, not a router IP) — proof
+> the proxy is not on the c2c path.
+>
+> `apps.internal` not resolving is a separate, pre-existing service-discovery matter
+> (it also failed on 52.0.0), independent of this upgrade. Only worth chasing if the
+> client's real Windows apps use name-based c2c in production.
 
 ```bash
 # (T1 warm-latency note) run T1 two or three times and record the WARM number;
