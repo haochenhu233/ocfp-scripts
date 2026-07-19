@@ -42,30 +42,39 @@ echo; echo "== T2  source IP the app sees =="
 echo "-- win-hwc --"; curl -ksS "$HWC/whoami.ashx"; echo
 echo "-- win-bin --"; curl -ksS "$BIN/whoami"; echo
 
-echo; echo "== T3  c2c (by container IP from local_addr; still enforced by the network policy) =="
-# Use local_addr (the container's own IP) as the c2c target. On Windows,
-# CF_INSTANCE_INTERNAL_IP is often empty, which would make the target :8080 -> localhost.
-BININT=$(curl -ksS "$BIN/whoami"      | sed 's/.*"local_addr":"\([^"]*\)".*/\1/')
-HWCINT=$(curl -ksS "$HWC/whoami.ashx" | sed 's/.*"local_addr":"\([^"]*\)".*/\1/')
-echo "win-bin ip: $BININT   win-hwc ip: $HWCINT"
-echo "-- hwc -> bin --"; curl -ksS "$HWC/callout.ashx?target=$BININT:8080&path=/whoami"; echo
-echo "-- bin -> hwc --"; curl -ksS "$BIN/callout?target=$HWCINT:8080&path=/whoami.ashx"; echo
+echo; echo "== T3  c2c (by container IP; still enforced by the network policy) =="
+# grep (not sed) so a missing field yields empty, never the whole JSON line.
+val() { curl -ksS "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | cut -d'"' -f4; }
+BININT=$(val "$BIN/whoami"      cf_instance_internal_ip); BINCELL=$(val "$BIN/whoami"      cf_instance_ip)
+HWCINT=$(val "$HWC/whoami.ashx" cf_instance_internal_ip); HWCCELL=$(val "$HWC/whoami.ashx" cf_instance_ip)
+echo "win-bin ip=$BININT cell=$BINCELL   win-hwc ip=$HWCINT cell=$HWCCELL"
+if [ "$BINCELL" = "$HWCCELL" ] && [ -n "$BINCELL" ]; then
+  echo "same cell -> c2c-by-IP should work"
+else
+  echo "DIFFERENT cells -> Windows container subnets are per-cell; c2c-by-IP will time out"
+  echo "(pre-existing Windows networking, unrelated to route integrity; co-locate both apps on one cell to test empirically)"
+fi
+echo "-- hwc -> bin --"; curl -ksS --max-time 15 "$HWC/callout.ashx?target=$BININT:8080&path=/whoami"; echo
+echo "-- bin -> hwc --"; curl -ksS --max-time 15 "$BIN/callout?target=$HWCINT:8080&path=/whoami.ashx"; echo
 } | tee "$OUT"
 ```
 
-> c2c by **container IP** deliberately bypasses `apps.internal` DNS. Our concern is
-> whether the route-integrity proxy affects the c2c network path, not name resolution.
-> `local_addr` is the app's own container IP (e.g. a Windows HNS `172.30.0.x`), which
-> is populated in both the pre- and post-upgrade states; `CF_INSTANCE_INTERNAL_IP` is
-> often empty on Windows, so we do NOT use it here.
+> c2c by **container IP** deliberately bypasses `apps.internal` DNS. A passing T3
+> returns the OTHER app's whoami with its `remote_addr` = the CALLER's container IP
+> (not `127.0.0.1`, not a router IP) — proof the proxy is not on the c2c path. This
+> only works when **both apps are on the same Windows cell**, because container subnets
+> (`172.30.x.x`) are assigned per-cell and are not routable cross-cell in this env.
 >
-> A passing T3 returns the OTHER app's whoami, and inside it the destination's
-> `remote_addr` is the CALLER's container IP (not `127.0.0.1`, not a router IP) — proof
-> the proxy is not on the c2c path.
+> **You may not even need this test.** The route-integrity proxy sits on the
+> `*_tls_proxy` ports from `cf_instance_ports` (e.g. 40000 / 61001 / 61443), while the
+> app listens on 8080, so c2c to 8080 structurally bypasses the proxy. And the absence
+> of a plain `external` port for internal 8080 in `cf_instance_ports` (only
+> `external_tls_proxy`) is direct proof that `enable_unproxied_port_mappings:false`
+> removed the plaintext host port — i.e. T4 is confirmed without a jumpbox.
 >
-> `apps.internal` not resolving is a separate, pre-existing service-discovery matter
-> (it also failed on 52.0.0), independent of this upgrade. Only worth chasing if the
-> client's real Windows apps use name-based c2c in production.
+> `apps.internal` not resolving and cross-cell c2c timing out are the same pre-existing
+> Windows-networking matter (also broken on 52.0.0), independent of this upgrade. Only
+> worth chasing if the client's real Windows apps use c2c in production.
 
 ```bash
 # (T1 warm-latency note) run T1 two or three times and record the WARM number;
