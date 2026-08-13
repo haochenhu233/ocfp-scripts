@@ -28,9 +28,29 @@ Standard metrics (cpu/memory/throughput) bypass the WRITE path entirely
   the `connection refused` log lines are a startup ordering race — red herring.
 - Lab runs loggregator-agent 7.7.3, sbx 8.3.19 (from CF exodus, not kit-pinned).
 - Release 15.13.x broker defaults `default_credential_type: x509` → new bindings
-  get **mtls_url only** (no basic-auth creds). Prime suspect for the outage.
+  get **mtls_url only** (no basic-auth creds).
 - apiserver logged `sql: no rows` for service_instance `cf3ee224-…` → possible
   DB-content gap (check Stage 5).
+
+## ROOT CAUSE (confirmed 2026-08-12, Stage 3A → 401 → MF log)
+
+In-container mTLS submission returned **401**; metricsforwarder logged
+`authentication method not found` — per `metricsforwarder/server/auth/authenticator.go`
+that means **neither an XFCC header nor basic-auth reached MF**: the client
+certificate is stripped between the app container and metricsforwarder.
+
+Chain of failure:
+```
+15.13.0 upgrade  → broker default_credential_type flips to x509
+                 → bindings created/re-created since are mTLS-only
+edge cannot deliver client certs on the *-mtls route (see Stage 3C)
+                 → those bindings' custom metrics are unsubmittable
+                 → eventgenerator has nothing to aggregate → cf asm empty
+```
+The rotated autoscaler certs, the binding-cache "refused" logs, and the
+loggregator-agent version delta were all red herrings.
+
+→ **Fix procedure: see "Remedy procedure (confirmed fix)" at the bottom.**
 
 ---
 
@@ -91,6 +111,37 @@ curl -sk -w '\nHTTP %{http_code}\n' -u '<username>:<password>' \
   -H 'Content-Type: application/json' \
   -d '{"instance_index":0,"metrics":[{"name":"dummy_queue_messages_ready","value":42,"unit":""}]}'
 ```
+
+### 3C — mTLS edge-delivery check (run after a 401 + "authentication method not found")
+
+Determines WHERE the client cert gets stripped. The x509 path needs every hop to
+cooperate: `container → (LB) → gorouter (client_cert_validation: request +
+forwarded_client_cert: sanitize_set → sets XFCC) → MF`.
+
+```bash
+# (1) inside the app container - does the TLS endpoint even REQUEST a client cert?
+MTLS_HOST=$(echo $VCAP_SERVICES | grep -o '"mtls_url":"https://[^"]*' | cut -d/ -f3 | head -1)
+openssl s_client -connect ${MTLS_HOST}:443 </dev/null 2>/dev/null \
+  | grep -i "acceptable client\|certificate request" \
+  || echo "NO CertificateRequest -> nothing on this path asks for a client cert"
+
+# (2) where does the mtls hostname terminate TLS? (LB type)
+dig +short ${MTLS_HOST}        # ALB/NLB-TLS listener = terminates TLS = strips client certs
+                               # NLB TCP passthrough = OK, cert reaches gorouter
+
+# (3) CF-side - gorouter's XFCC settings:
+bosh -d <cf-deployment> ssh router -c \
+  'sudo grep -E "forwarded_client_cert|client_cert_validation" /var/vcap/jobs/gorouter/config/gorouter.yml'
+# need: client_cert_validation: request   AND   forwarded_client_cert: sanitize_set
+# "always_forward" only relays a client-sent XFCC header - it never SETS one from
+# the TLS handshake cert, so instance-identity auth can never work with it.
+```
+
+| Observation | Meaning |
+|---|---|
+| no CertificateRequest in (1) | LB terminates TLS without mTLS, or gorouter validation off — cert dies at the edge |
+| CertificateRequest present but still 401 | gorouter gets the cert but doesn't set XFCC → `forwarded_client_cert` is not `sanitize_set` |
+| all configured correctly, still 401 | re-check MF log wording — a CA error ("unknown authority") means the exodus-snapshotted `diego_instance_identity_ca` is stale vs Diego's current CA |
 
 ### Reading the status code
 
@@ -153,16 +204,39 @@ sudo /var/vcap/bosh/bin/monit summary
 
 ---
 
-## Remedies (pick by emitter architecture)
+## Remedy procedure (confirmed fix)
 
-1. **Per-binding basic auth** (required if the emitter runs OUTSIDE the app
-   container): `cf unbind-service` then
-   `cf bind-service <app> <instance> -c '{"credential-type":"binding-secret", ...policy...}'`
-2. **Deployment-wide default**: set
-   `autoscaler.apiserver.broker.default_credential_type: binding-secret`
-   via kit/env params (restores pre-15.13 behavior for all new bindings).
-3. **Modernize emitter to mTLS**: use `mtls_url` with `$CF_INSTANCE_CERT`/`$CF_INSTANCE_KEY`
-   (in-container only; certs rotate ~daily — re-read the files on every request).
+The edge cannot deliver client certs (root cause above), so x509 bindings are
+unusable on this foundation. Revert the broker default and rebind:
+
+```bash
+# 1. autoscaler env: set the broker default back to binding-secret
+#    (env yaml / kit params on the autoscaler deployment):
+#      autoscaler.apiserver.broker.default_credential_type: binding-secret
+genesis deploy <autoscaler-env>
+
+# 2. rebind every binding created/re-created since the 15.13.0 upgrade
+#    (they are mTLS-only; rebinding mints basic-auth creds):
+cf unbind-service <app> <autoscaler-instance>
+cf bind-service   <app> <autoscaler-instance> -c <policy.json>
+cf restart <app>          # container env (VCAP_SERVICES) updates on restart only
+
+# 3. verify end-to-end (also exercises the log-cache drain hop live):
+cf ssh <app>
+./submit-custom-metric.sh <metric-name> 42      # expect: basic-auth mode, 2xx
+exit
+cf tail <app> --envelope-class metrics           # raw envelope arrives in log-cache
+sleep 120 && cf asm <app> <metric-name>          # aggregated rows appear
+```
+
+Per-binding alternative (no redeploy; also documents intent explicitly):
+`cf bind-service <app> <instance> -c '{"credential-type":"binding-secret", ...policy...}'`
+
+Long-term option (CF/LB surgery, not needed for the feature to work): make the
+edge mTLS-capable — passthrough LB listener for the `*-mtls` hostname + gorouter
+`client_cert_validation: request` / `forwarded_client_cert: sanitize_set` — then
+emitters may use `mtls_url` with `$CF_INSTANCE_CERT`/`$CF_INSTANCE_KEY`
+(in-container only; certs rotate ~daily — re-read the files on every request).
 
 Known kit issues in this area (fixed on cf-app-autoscaler-genesis-kit develop):
 - 5.1.0 OCFP external-db manifest-gen failure (fixed 5.1.1)
