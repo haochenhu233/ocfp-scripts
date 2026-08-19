@@ -123,15 +123,29 @@ SELECT name, setting, source FROM pg_settings
 SELECT rolname, rolconfig FROM pg_roles WHERE rolname IN ('atc', current_user);
 ```
 
-✅ **Want:** all `0` (disabled).
-❌ **Any non-zero value shorter than your rehearsed migration duration will kill the migration.**
+**They are not equally dangerous — read this table before changing anything:**
 
-Fix — either in a custom parameter group (dynamic, no reboot), or per-role:
+| Setting | What it kills | Risk to the migration | Acceptable value |
+|---|---|---|---|
+| **`statement_timeout`** | a statement that **runs** longer than the limit | 🔴 **HIGH — this is the one that kills the long `UPDATE`** | `0`, or comfortably > rehearsed duration |
+| `idle_in_transaction_session_timeout` | a session sitting in state `idle in transaction` (BEGIN issued, nothing executing, client silent) | 🟢 **Effectively none** — during the `UPDATE` the backend is `active`, not idle. The engine runs the whole `.sql` file as **one** `tx.Exec` (`atc/db/migration/migration.go:379-421`), so the only idle-in-transaction gaps are microseconds of Go error-checking between calls. | anything ≳ a few minutes. **`1d` (86400000 ms, the common RDS default) is fine — leave it alone.** |
+| `lock_timeout` | a statement waiting too long to **acquire a lock** | 🟡 Low (you pause pipelines first), but it fails *fast*: if a conflicting query holds a lock when the DDL wants `ACCESS EXCLUSIVE`, this errors immediately instead of waiting | `0` is safest |
+
+❌ **Act only if `statement_timeout` is non-zero and shorter than your rehearsed migration
+duration.** Fix in a custom parameter group (dynamic — no reboot), or per-role as the RDS master
+user:
 
 ```sql
--- as the RDS master user:
+-- as the RDS master user; only if the table above says you need to
 ALTER ROLE atc SET statement_timeout = 0;
-ALTER ROLE atc SET idle_in_transaction_session_timeout = 0;
+ALTER ROLE atc SET lock_timeout = 0;
+```
+
+Confirm it took effect on a **new** connection (role settings apply at login):
+
+```sql
+-- reconnect, then:
+SHOW statement_timeout;
 ```
 
 ### 0.6 pgcrypto — a **runtime** dependency in Concourse 8
@@ -482,7 +496,7 @@ cd - >/dev/null
 | ✅ Baseline | Parts 2–4 run; `SUMMARY.txt` + `21-jobs-not-green.tsv` reviewed |
 | ✅ Target | Release pinned to **8.2.2** — never 8.0.0 |
 | ✅ `canary_watch_time` | Raised from the kit default of **60 s** to ≥ 3× rehearsed duration |
-| ✅ Timeouts | `statement_timeout` / `idle_in_transaction_session_timeout` = 0 (Part 0.5) |
+| ✅ Timeouts | **`statement_timeout` = 0** (or > rehearsed duration) — Part 0.5. `idle_in_transaction_session_timeout` does **not** need changing |
 | ✅ pgcrypto | Installed and callable (Part 0.6) |
 | ✅ Storage | ≥ 2× `resource_config_versions` total size free; autoscaling headroom checked |
 | ✅ Maintenance window | RDS `PreferredMaintenanceWindow` does **not** overlap — a Multi-AZ failover aborts the migration |
@@ -933,7 +947,8 @@ bosh -d "$DEP" logs web --num 500 | grep -iE 'migration|failed|error|rolled back
 
 | Topic | Detail |
 |---|---|
-| 🔴 **`statement_timeout`** | Concourse sets none (`flag/postgres_config.go:34-70` — only a dial timeout), so any value comes from your **parameter group** or the `atc` role. A value shorter than the migration **kills it mid-transaction**. Set to `0` in a custom parameter group (dynamic — no reboot) or per-role. Same for `idle_in_transaction_session_timeout`. |
+| 🔴 **`statement_timeout`** | Concourse sets none (`flag/postgres_config.go:34-70` — only a dial timeout), so any value comes from your **parameter group** or the `atc` role. A value shorter than the migration **kills it mid-transaction**. Set to `0` in a custom parameter group (dynamic — no reboot) or per-role. |
+| 🟢 `idle_in_transaction_session_timeout` | **Not a risk — do not change it.** It only kills sessions that are `idle in transaction`; the migration is `active` throughout, and the engine runs the whole `.sql` file as one `tx.Exec`, so idle gaps are microseconds. `1d` (86400000 ms) is the common RDS default and is entirely fine. |
 | **Multi-AZ failover** | A failover during the long transaction aborts it. Check `PreferredMaintenanceWindow` does not overlap your upgrade window. |
 | **Storage** | CloudWatch `FreeStorageSpace`, not `df`. Need ~2× `resource_config_versions` total size free. If autoscaling is on, confirm `MaxAllocatedStorage` headroom; if off, pre-grow (online, but takes time and cannot be reversed). |
 | **Backup = snapshot** | `create-db-snapshot` is far faster to take *and restore* than `pg_dump`. Take one immediately before the deploy — automated backups may not cover your exact pre-deploy moment. |
