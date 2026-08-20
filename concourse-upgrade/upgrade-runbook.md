@@ -109,38 +109,53 @@ fly -t "$FLY_TARGET" teams      # can you see ALL teams?
    calls; if the token dies partway through you get a truncated baseline rather than an error. The
    Part 2 script guards against this, but re-run `genesis <env> do login` if the expiry is close.
 
-### 0.2 Connect to RDS — open this session and keep it open
+### 0.2 Connect to RDS
+
+Define the connection **once**, so the same string serves both interactive use and scripted runs:
 
 ```bash
 # RDS CA bundle (kit defaults external_db_sslmode: verify-ca)
 curl -o rds-ca-bundle.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 
 export PGPASSWORD="$(safe get secret/${GENESIS_ENV}/concourse/database/external:password)"
+export PGURL="host=<your-rds-endpoint>.rds.amazonaws.com port=5432 dbname=atc user=atc \
+sslmode=verify-ca sslrootcert=$PWD/rds-ca-bundle.pem"
 
-psql "host=<your-rds-endpoint>.rds.amazonaws.com \
-      port=5432 dbname=atc user=atc \
-      sslmode=verify-ca sslrootcert=rds-ca-bundle.pem"
+psql "$PGURL" -c "SELECT current_database(), current_user;"    # smoke test
 ```
 
-**Everything marked ```sql from here on is pasted into this session.**
+Two ways to run SQL against RDS from here on:
 
-### 0.3 Session setup
+| Form | Use for |
+|---|---|
+| `psql "$PGURL"` then paste | ad-hoc queries, the short checks in Parts 7–11 |
+| `psql "$PGURL" -f x.sql > out.txt 2>&1` | 🔑 **the Part 3 / 4 / 9 captures** — reproducible, and captures errors too |
+
+> ⚠️ **Use the `-f` form for anything you need a file from.** Do **not** try to capture output with
+> `\o | tee` inside an interactive session: `\o |cmd` opens a *pipe*, which stdio block-buffers, so
+> nothing reaches the file or the screen until you close it with a bare `\o` — and `\echo` output
+> never enters the `\o` stream at all (that requires `\qecho`). A shell redirect on `psql -f`
+> captures stdout **and** stderr with no such traps. *(If you already hit this: type a bare `\o` —
+> your buffered output will flush and the file will populate.)*
+
+### 0.3 Interactive session setup
+
+For the ad-hoc psql sessions (`psql "$PGURL"`):
 
 ```sql
 \timing on
 \x auto
-\set ON_ERROR_STOP on
 ```
 
-Handy meta-commands while you work:
+Handy meta-commands:
 
 | Command | Does |
 |---|---|
 | `\d resource_config_versions` | describe a table — columns, indexes, constraints |
 | `\di` | list indexes |
-| `\o file.txt` | send output to a file (`\o` alone to stop) |
-| `` \o | tee file.txt `` | send output to a file **and** the screen |
 | `\i file.sql` | run a SQL file |
+| `\o file.txt` … `\o` | redirect query output to a file; bare `\o` closes **and flushes** it |
+| `\qecho 'text'` | write a literal line **into** the `\o` stream (`\echo` does *not*) |
 | `\q` | quit |
 
 ### 0.4 Confirm connectivity and scale
@@ -458,11 +473,12 @@ fly -t "$T" status >/dev/null 2>&1 \
 
 ## Part 3 — Baseline: database
 
-In your psql session. `\o | tee` writes the file **and** shows you the output.
+Write the SQL to a file once, then run it with `psql -f`. You will run **the identical file again**
+in Part 9 for the post-upgrade comparison — that is what makes the diff trustworthy, and why this
+is not a copy-paste-into-psql step.
 
-```sql
-\o | tee 70-db-baseline-pre.txt
-
+```bash
+cat > baseline.sql <<'SQL'
 \echo '===== migration version ====='
 SELECT version, direction, status, dirty, tstamp
   FROM migrations_history ORDER BY tstamp DESC LIMIT 5;
@@ -527,15 +543,19 @@ SELECT name, setting, source FROM pg_settings
 \echo '===== version & size ====='
 SELECT version();
 SELECT pg_size_pretty(pg_database_size(current_database())) AS db_size;
+SQL
 
-\o
+# run it — shell redirect captures query output, \echo headers AND any errors
+psql "$PGURL" -f baseline.sql > "$OUT/70-db-baseline-pre.txt" 2>&1
+
+# ALWAYS check it actually produced something
+wc -l "$OUT/70-db-baseline-pre.txt"
+grep -iE '^(ERROR|FATAL)' "$OUT/70-db-baseline-pre.txt" && echo "🔴 errors above — fix before proceeding"
+tail -40 "$OUT/70-db-baseline-pre.txt"
 ```
 
-Then move the captured file into the artifact dir (from a **shell**, not psql):
-
-```bash
-mv 70-db-baseline-pre.txt "$OUT/"
-```
+> 💡 Keep `baseline.sql` — Part 9 re-runs **this exact file** against the upgraded DB. Do not edit
+> it in between, or the diff becomes meaningless.
 
 **Storage headroom** — on RDS this is CloudWatch, not `df`:
 
@@ -567,29 +587,32 @@ while the GIN index rebuilds, all before `COMMIT`.
 
 ## Part 4 — Baseline: performance + breaking-change audit
 
-In psql:
+Same pattern — write once, run with `-f`, re-run the identical file in Part 9:
 
-```sql
-\o | tee 80-perf-baseline-pre.txt
+```bash
+cat > perf.sql <<'SQL'
+\timing on
 
+\echo '===== Q1: scheduler hot path (check_order btree) ====='
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT rcv.id, rcv.version FROM resource_config_versions rcv
  WHERE rcv.resource_config_scope_id =
        (SELECT resource_config_scope_id FROM resources WHERE resource_config_scope_id IS NOT NULL LIMIT 1)
  ORDER BY rcv.check_order DESC LIMIT 100;
 
+\echo '===== Q2: GIN index path ====='
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT count(*) FROM resource_config_versions WHERE version::jsonb @> '{}'::jsonb;
 
+\echo '===== Q3: build lineage join (digest columns) ====='
 EXPLAIN (ANALYZE, BUFFERS)
 SELECT count(*) FROM build_resource_config_version_inputs i
   JOIN builds b ON b.id = i.build_id WHERE b.id > (SELECT max(id)-1000 FROM builds);
+SQL
 
-\o
-```
+psql "$PGURL" -f perf.sql > "$OUT/80-perf-baseline-pre.txt" 2>&1
 
-```bash
-mv 80-perf-baseline-pre.txt "$OUT/"
+wc -l "$OUT/80-perf-baseline-pre.txt"
 grep -E 'Execution Time|Planning Time|Seq Scan|Index Scan' "$OUT/80-perf-baseline-pre.txt"
 
 # one real build, timed
@@ -857,20 +880,20 @@ export LABEL=post
 export OUT_POST="./cc-upgrade-post-$(date +%Y%m%d-%H%M)"
 export OUT_PRE="./cc-upgrade-pre-<timestamp>"      # ← your Part 2 directory
 export OUT="$OUT_POST"; mkdir -p "$OUT"
-# re-run the Part 2 shell script
+
+# 1. re-run the Part 2 shell script (unchanged)
+
+# 2. re-run the SAME SQL files from Parts 3 and 4 — do not edit them
+psql "$PGURL" -f baseline.sql > "$OUT/70-db-baseline-post.txt" 2>&1
+psql "$PGURL" -f perf.sql     > "$OUT/80-perf-baseline-post.txt" 2>&1
+
+# 3. sanity-check both produced output before trusting any diff
+wc -l "$OUT"/70-db-baseline-post.txt "$OUT"/80-perf-baseline-post.txt
+grep -iE '^(ERROR|FATAL)' "$OUT"/70-db-baseline-post.txt
 ```
 
-Re-run the **Part 3** and **Part 4** SQL in psql, changing the output filenames:
-
-```sql
-\o | tee 70-db-baseline-post.txt
--- ... paste the same Part 3 block ...
-\o
-```
-
-```bash
-mv 70-db-baseline-post.txt 80-perf-baseline-post.txt "$OUT/"
-```
+> 🔑 Running the **identical files** is what makes §9.2's diff meaningful. A hand-retyped query
+> produces spurious differences that waste window time.
 
 ### 9.2 Diff
 
@@ -1103,7 +1126,8 @@ bosh -d "$DEP" logs web --num 500 | grep -iE 'migration|failed|error|rolled back
                   ⏱️ that duration → canary_watch_time (>=3x; kit default is only 60s!)
 
 2-4 BASELINE      shell: pipelines, ALL configs, jobs-not-green, resources+pins
-                  psql:  \o | tee 70-db-baseline-pre.txt  → counts/sizes/fingerprints
+                  psql:  psql "$PGURL" -f baseline.sql > 70-db-baseline-pre.txt 2>&1
+                         (keep baseline.sql + perf.sql — Part 9 re-runs the SAME files)
                   ✍️ write down: rcv / pins / disabled counts
 
 5   GO-NO-GO      gates + abort thresholds + set-wall + pause (90-was-running.tsv) + SNAPSHOT
