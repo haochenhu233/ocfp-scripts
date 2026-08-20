@@ -521,7 +521,12 @@ SELECT rp.resource_id, r.name AS resource, rp.version
  ORDER BY 1 LIMIT 200;
 
 \echo '===== DISABLED versions (must survive identically) ====='
-SELECT rdv.resource_id, r.name AS resource, rdv.version_md5
+-- NB: the migration RENAMES this column version_md5 -> version_digest, so read it
+-- schema-agnostically: to_jsonb(row)->>'key' yields NULL for a missing key instead of
+-- erroring, letting this exact file run unchanged both pre- and post-upgrade.
+SELECT rdv.resource_id, r.name AS resource,
+       COALESCE(to_jsonb(rdv)->>'version_md5',
+                to_jsonb(rdv)->>'version_digest') AS version_digest
   FROM resource_disabled_versions rdv JOIN resources r ON r.id = rdv.resource_id
  ORDER BY 1,3 LIMIT 200;
 
