@@ -50,12 +50,64 @@ cleanup and the `rerun_of` down migration. 8.2.2 has all of it.
 ```bash
 export DEP=concourse                    # BOSH deployment name
 export GENESIS_ENV=prod                 # genesis env name
-export FLY_TARGET=my-concourse          # fly target
 export RDS_ID=<your-rds-instance-id>    # RDS DBInstanceIdentifier
 export LABEL=pre                        # "pre" now, "post" after the upgrade
 export OUT="./cc-upgrade-$LABEL-$(date +%Y%m%d-%H%M)"
 mkdir -p "$OUT" && echo "→ $OUT"
 ```
+
+**Establish the fly target.** The kit's login addon does this for you — it pulls the URL, username
+and password from exodus and adds `-k` automatically if the deployment is self-signed
+(`hooks/addon-login~li.pm`):
+
+```bash
+genesis "$GENESIS_ENV" do login     # no team arg → logs in to `main` using the exodus local user
+
+# derive the target name the same way the addon does — don't hand-copy it
+HOST_ENV=$(genesis "$GENESIS_ENV" lookup --exodus host_env "$GENESIS_ENV")
+export FLY_TARGET=$(genesis "$GENESIS_ENV" lookup --exodus \
+                      --exodus-for "$HOST_ENV/concourse" main_target "$HOST_ENV")
+echo "fly target: $FLY_TARGET"
+```
+
+`genesis do login` creates an ordinary `~/.flyrc` target, so **nothing else in this runbook needs
+to change** — every `fly -t "$FLY_TARGET" …` works as written.
+
+> ⚠️ **`-t` is not optional.** Unlike `kubectl`/`cf`, fly has **no "current target"** and reads no
+> `FLY_TARGET` environment variable — the flag is declared `short:"t" long:"target"` with no `env:`
+> tag (`fly/commands/fly.go:10`), and every command resolves it via `rc.LoadTarget(Fly.Target, …)`.
+> A bare `fly pipelines` fails with `unknown target:` even immediately after `genesis do login`.
+> The `FLY_TARGET` variable in this runbook is **ours**, consumed by `-t "$FLY_TARGET"`.
+
+If you'd rather not think about the target for **ad-hoc** commands, the kit wraps it:
+
+```bash
+genesis "$GENESIS_ENV" do fly pipelines      # no -t needed; auto-logs-in only if the token is stale
+```
+
+That's fine interactively. Don't rewrite the Part 2 capture to use it: each invocation pays genesis
+startup plus Vault exodus lookups, which is real overhead across ~100+ calls. If you want the same
+ergonomics in your shell without that cost, alias it instead:
+
+```bash
+fly() { command fly -t "$FLY_TARGET" "$@"; }   # then: fly pipelines
+```
+
+**Two things to confirm before relying on it:**
+
+```bash
+fly -t "$FLY_TARGET" status     # token valid?
+fly -t "$FLY_TARGET" teams      # can you see ALL teams?
+```
+
+1. 🔑 **You must be a `main`-team admin.** The Part 2 capture walks every team with `--team`. That
+   only works if your token belongs to `main` (Concourse treats `main` members as admins). If
+   `fly teams` shows fewer teams than exist, the baseline is **silently incomplete** and the
+   pre/post diff will miss pipelines. Logging in *without* a team argument is what you want here —
+   the addon then uses the exodus local admin user.
+2. ⏱️ **Tokens expire.** Check the `expiry` column in `fly targets`. The capture makes a long run of
+   calls; if the token dies partway through you get a truncated baseline rather than an error. The
+   Part 2 script guards against this, but re-run `genesis <env> do login` if the expiry is close.
 
 ### 0.2 Connect to RDS — open this session and keep it open
 
@@ -278,36 +330,57 @@ aws rds delete-db-instance --db-instance-identifier cc-rehearsal --skip-final-sn
 
 ---
 
-## Part 2 — Baseline: fly & BOSH capture
+## Part 2 — Baseline: pipeline state (+ optional deployment evidence)
 
-Pure shell — no DB access needed.
+Pure shell — no DB access needed. The script has two independent sections:
+
+| Section | Needs | Answers |
+|---|---|---|
+| **A — pipeline state** | `FLY_TARGET` only | *Which pipelines/jobs/resources exist, and **which were already red before we touched anything**?* |
+| **B — deployment evidence** | `DEP` / `GENESIS_ENV` (both optional) | *Did the deployment change the way I intended?* — release actually went 7.13.2→8.2.2, VMs healthy, manifest diff for Part 6 |
+
+**Section A is the one that protects your window.** If you only have `fly` access — no BOSH CLI, no
+genesis checkout — leave `DEP` and `GENESIS_ENV` unset and the script still produces the complete
+pipeline baseline; Section B prints `SKIPPED` and `SUMMARY.txt` records that. Only two things are
+lost: the release-version proof, and the Part 6 manifest diff.
 
 ```bash
 #!/usr/bin/env bash
 set -uo pipefail
-: "${FLY_TARGET:?}"; : "${DEP:?}"; : "${OUT:?}"
+# REQUIRED: fly only. The pipeline/job/resource baseline needs nothing but a fly login.
+: "${FLY_TARGET:?}"; : "${OUT:?}"
 T="$FLY_TARGET"
 
-echo "==> [1/7] version & topology"
+# OPTIONAL: BOSH/genesis. Only used for deployment-side evidence (section B below).
+# Unset them and the script still produces the full pipeline baseline.
+DEP="${DEP:-}"; GENESIS_ENV="${GENESIS_ENV:-}"
+
+# --- auth pre-flight: fail loudly now rather than capturing a silently truncated baseline ---
+fly -t "$T" status >/dev/null 2>&1 || {
+  echo "FATAL: fly target '$T' not logged in. Run: genesis <env> do login"; exit 1; }
+TEAMS_SEEN=$(fly -t "$T" teams --json | jq 'length')
+echo "auth OK — $TEAMS_SEEN team(s) visible. If that looks low, you are NOT a main-team admin."
+
+################ SECTION A — pipeline state (fly only) ################
+
+echo "==> [A1] concourse version, workers, teams"
 fly -t "$T" curl /api/v1/info                        > "$OUT/00-info.json" 2>&1
-bosh -d "$DEP" instances --ps                        > "$OUT/01-bosh-instances.txt" 2>&1
-bosh -d "$DEP" releases                              > "$OUT/02-bosh-releases.txt" 2>&1
 fly -t "$T" workers --details --json                 > "$OUT/03-workers.json" 2>&1
 fly -t "$T" teams --json                             > "$OUT/04-teams.json" 2>&1
 
-echo "==> [2/7] pipeline inventory"
+echo "==> [A2] pipeline inventory"
 fly -t "$T" pipelines --all --include-archived --json > "$OUT/10-pipelines.json" 2>&1
 jq -r '.[] | [.team_name,.name,(.paused|tostring),(.archived|tostring)] | @tsv' \
   "$OUT/10-pipelines.json" | sort > "$OUT/11-pipelines.tsv"
 
-echo "==> [3/7] pipeline configs   <-- ALSO YOUR ROLLBACK ARTIFACT"
+echo "==> [A3] pipeline configs   <-- ALSO YOUR ROLLBACK ARTIFACT"
 mkdir -p "$OUT/configs"
 while IFS=$'\t' read -r team pipe _p _a; do
   [ -z "${pipe:-}" ] && continue
   fly -t "$T" get-pipeline --team "$team" -p "$pipe" > "$OUT/configs/${team}__${pipe}.yml" 2>/dev/null
 done < "$OUT/11-pipelines.tsv"
 
-echo "==> [4/7] job status   <-- WHAT IS ALREADY RED"
+echo "==> [A4] job status   <-- WHAT IS ALREADY RED (the whole point of this script)"
 : > "$OUT/20-jobs-all.tsv"
 while IFS=$'\t' read -r team pipe _p arch; do
   [ -z "${pipe:-}" ] || [ "$arch" = "true" ] && continue
@@ -319,7 +392,7 @@ done < "$OUT/11-pipelines.tsv"
 sort -o "$OUT/20-jobs-all.tsv" "$OUT/20-jobs-all.tsv"
 awk -F'\t' '$5!="succeeded" && $5!="none"' "$OUT/20-jobs-all.tsv" > "$OUT/21-jobs-not-green.tsv"
 
-echo "==> [5/7] resources + pins"
+echo "==> [A5] resources + pins"
 : > "$OUT/30-resources-all.tsv"
 while IFS=$'\t' read -r team pipe _p arch; do
   [ -z "${pipe:-}" ] || [ "$arch" = "true" ] && continue
@@ -330,13 +403,35 @@ while IFS=$'\t' read -r team pipe _p arch; do
 done < "$OUT/11-pipelines.tsv"
 sort -o "$OUT/30-resources-all.tsv" "$OUT/30-resources-all.tsv"
 
-echo "==> [6/7] builds & runtime footprint"
+echo "==> [A6] builds & runtime footprint"
 fly -t "$T" builds --all-teams --count 200 --json > "$OUT/40-builds-recent.json" 2>&1
 fly -t "$T" containers --json > "$OUT/50-containers.json" 2>&1
 fly -t "$T" volumes    --json > "$OUT/51-volumes.json"    2>&1
 
-echo "==> [7/7] manifest"
-genesis manifest "$GENESIS_ENV" > "$OUT/60-manifest.yml" 2>/dev/null
+################ SECTION B — deployment evidence (optional; needs bosh/genesis) ################
+# Nothing here is needed to prove "which pipelines were already red".
+# It answers a different question: did the DEPLOYMENT change the way I intended?
+
+if [ -n "$DEP" ]; then
+  echo "==> [B1] BOSH VM + release state"
+  bosh -d "$DEP" instances --ps > "$OUT/01-bosh-instances.txt" 2>&1   # all processes running?
+  bosh -d "$DEP" releases       > "$OUT/02-bosh-releases.txt"  2>&1   # proves 7.13.2 -> 8.2.2
+else
+  echo "==> [B1] SKIPPED (DEP unset) — no BOSH VM/release evidence"
+fi
+
+if [ -n "$GENESIS_ENV" ]; then
+  echo "==> [B2] manifest snapshot"
+  # Part 6 diffs this against the post-edit manifest, to catch unintended env-file changes
+  genesis manifest "$GENESIS_ENV" > "$OUT/60-manifest.yml" 2>/dev/null
+else
+  echo "==> [B2] SKIPPED (GENESIS_ENV unset) — no manifest diff available in Part 6"
+fi
+
+# --- auth post-check: prove the token was still valid at the END, so the capture is complete ---
+fly -t "$T" status >/dev/null 2>&1 \
+  && echo "auth still valid at end — capture is complete" \
+  || echo "🔴 WARNING: token expired DURING capture — baseline is INCOMPLETE, re-login and re-run"
 
 { echo "captured:       $(date -u +%FT%TZ)"
   echo "concourse ver:  $(jq -r '.version // "?"' "$OUT/00-info.json")"
@@ -348,6 +443,8 @@ genesis manifest "$GENESIS_ENV" > "$OUT/60-manifest.yml" 2>/dev/null
   echo "resources:      $(wc -l < "$OUT/30-resources-all.tsv")"
   echo "containers:     $(jq 'length' "$OUT/50-containers.json")"
   echo "volumes:        $(jq 'length' "$OUT/51-volumes.json")"
+  echo "bosh evidence:  $([ -s "$OUT/02-bosh-releases.txt" ] && echo yes || echo 'SKIPPED')"
+  echo "manifest:       $([ -s "$OUT/60-manifest.yml" ]      && echo yes || echo 'SKIPPED')"
 } | tee "$OUT/SUMMARY.txt"
 ```
 
