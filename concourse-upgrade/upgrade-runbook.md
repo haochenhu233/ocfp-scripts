@@ -172,7 +172,23 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 ## Part 1 — 🔴 Rehearse (do not skip)
 
-Use the sandbox for **two different things** — they answer different questions.
+Two rehearsals that answer **two different questions**. Neither substitutes for the other.
+
+| | **1a — sbx dress rehearsal** | **1b — prod-scale timing** |
+|---|---|---|
+| Question | *Does the procedure work?* | *How long will it take on prod?* |
+| Validates | commands, release pin, SQL, deploy rolls cleanly | ⏱️ **duration**, on real data volume |
+| Runs against | the sandbox Concourse + its own RDS | a **throwaway RDS restored from a prod snapshot** |
+| Prod impact | none | none — snapshot is read-only and non-disruptive |
+
+> ⚠️ **Three different databases are in play across this runbook.** Know which one you're connected
+> to at any moment:
+>
+> | Database | Used in | What happens to it |
+> |---|---|---|
+> | **prod RDS** | Part 0, Parts 2–11 | pre-checks + baseline (read-only until the Part 6 deploy) |
+> | **sbx RDS** | Part 1a | the full procedure, end to end |
+> | **`cc-rehearsal`** (throwaway, restored from a prod snapshot) | Part 1b | migration timed, then **deleted** |
 
 ### 1a. Full dress rehearsal on sbx — validates the *procedure*
 
@@ -192,8 +208,24 @@ Record what broke in the procedure, fix this runbook, then do prod.
 
 ### 1b. Prod-scale timing — validates the *duration*
 
-Restore a **prod** snapshot to a scratch instance and time the real migration on real data volume.
-This is the single best use of RDS in this whole exercise.
+**What this is:** snapshot prod → restore that snapshot into a **temporary throwaway RDS instance**
+→ run the real 8.2.2 migration against the copy with a stopwatch → delete the instance.
+**Production is never touched.**
+
+**Why you can't skip it and just use the sbx number:** sbx has a fraction of prod's pipelines and
+resource versions. The migration's cost scales with rows in `resource_config_versions` and the size
+of the GIN index rebuild, so a 90-second sbx run tells you nothing about prod.
+
+**Why the number matters:** the kit sets `canary_watch_time: 1000-60000` — **60 seconds max**
+(`manifests/concourse/base.yml:23`). The web VM cannot report healthy until the migration commits,
+so if prod takes 8 minutes and you haven't raised that, **BOSH fails the canary and aborts the
+deploy mid-upgrade**. This number is what you set it from (≥3×) and what sizes your window.
+
+**Two things you get free from the same exercise:** proof that your snapshot actually restores
+(that's your rollback path), and the post-migration bloat figures — so you know *before* the window
+whether you'll need `VACUUM FULL`, and therefore whether the window needs an extra outage in it.
+
+This is the single best use of RDS in the whole exercise.
 
 ```bash
 aws rds create-db-snapshot --db-instance-identifier "$RDS_ID" \
@@ -967,9 +999,11 @@ bosh -d "$DEP" logs web --num 500 | grep -iE 'migration|failed|error|rolled back
 0   CONNECT       psql "host=<rds> dbname=atc user=atc sslmode=verify-ca sslrootcert=..."
                   ⚠️ check statement_timeout = 0  AND  pgcrypto installed
 
-1   REHEARSE 🔴   1a full runbook on SBX (procedure)
-                  1b prod snapshot → restore-db-instance → `concourse migrate` → TIME IT
-                  → canary_watch_time = 3x
+1   REHEARSE 🔴   1a SBX           → full runbook end-to-end       = does the PROCEDURE work?
+                  1b PROD SNAPSHOT → restore to THROWAWAY rds
+                                   → `concourse migrate` → TIME IT = how LONG on prod?
+                                   → delete throwaway. Prod untouched.
+                  ⏱️ that duration → canary_watch_time (>=3x; kit default is only 60s!)
 
 2-4 BASELINE      shell: pipelines, ALL configs, jobs-not-green, resources+pins
                   psql:  \o | tee 70-db-baseline-pre.txt  → counts/sizes/fingerprints
